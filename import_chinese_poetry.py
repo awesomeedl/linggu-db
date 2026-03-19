@@ -433,10 +433,7 @@ def deduped(records: Generator[dict, None, None]) -> Generator[dict, None, None]
 
 # ── Direct postgres DDL (bypasses PostgREST for index management) ─────────────
 
-POSTGRES_DSN = os.environ.get(
-    "POSTGRES_DSN",
-    "postgresql://postgres:postgres@127.0.0.1:54322/postgres",
-)
+POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "")
 
 def _psql(sql: str) -> bool:
     """Run a SQL statement directly via psql. Returns True on success."""
@@ -587,11 +584,16 @@ def link_remaining_authors(supabase: Client):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    if SUPABASE_URL.startswith("https://YOUR"):
+    if SUPABASE_URL.startswith("https://YOUR") or not SUPABASE_URL:
         raise SystemExit(
             "Set SUPABASE_URL and SUPABASE_KEY before running.\n"
             "  export SUPABASE_URL='https://xxxx.supabase.co'\n"
             "  export SUPABASE_KEY='your-service-role-key'"
+        )
+    if not POSTGRES_DSN:
+        raise SystemExit(
+            "Set POSTGRES_DSN before running.\n"
+            "  export POSTGRES_DSN='postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres'"
         )
 
     ensure_repo()

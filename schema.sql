@@ -1,28 +1,24 @@
 -- ============================================================
--- Chinese Poetry → Supabase: Schema
+-- Chinese Poetry → Postgres: Schema
 -- ============================================================
--- Run order:
---   1. Enable PGroonga:
---      Supabase dashboard → Extensions → search "pgroonga" → Enable
---      (or: CREATE EXTENSION IF NOT EXISTS pgroonga;)
---   2. Run this entire file in the SQL editor.
+-- 1. Enable PGroonga (Supabase: Extensions → "pgroonga" → Enable,
+--    or run: CREATE EXTENSION IF NOT EXISTS pgroonga;)
+-- 2. Run this file in the SQL editor.
 -- ============================================================
 
 
 -- ── Extension ────────────────────────────────────────────────────────────────
 
 CREATE EXTENSION IF NOT EXISTS pgroonga;
-
--- ── Authors table ─────────────────────────────────────────────────────────────
--- Seeded from the repo's authors.tang.json, authors.song.json, author.song.json.
--- bio_short and bio_long are left NULL after import — curate them manually.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;   -- trigram similarity for fuzzy dedup
+-- ── Authors ───────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS authors (
     id          BIGSERIAL PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
     dynasty     TEXT,
-    bio_short   TEXT,                   -- short biography (1–2 sentences)
-    bio_long    TEXT,                   -- full biography
+    bio_short   TEXT,          -- 1–2 sentence biography; curate manually
+    bio_long    TEXT,          -- full biography; curate manually
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -32,38 +28,32 @@ CREATE INDEX IF NOT EXISTS idx_authors_pgroonga
     USING pgroonga (name, bio_short, bio_long)
     WITH (tokenizer='TokenNgram("unify_alphabet", false, "unify_digit", false)');
 
--- Fast lookup by dynasty (for browsing)
-CREATE INDEX IF NOT EXISTS idx_authors_dynasty
-    ON authors (dynasty);
+CREATE INDEX IF NOT EXISTS idx_authors_dynasty ON authors (dynasty);
 
--- ── Poems table ───────────────────────────────────────────────────────────────
+-- ── Poems ─────────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS poems (
-    id          BIGSERIAL PRIMARY KEY,
-    title       TEXT,
-    author_id   BIGINT REFERENCES authors (id) ON DELETE SET NULL,
-    dynasty     TEXT,
-    collection  TEXT NOT NULL,
-    text        TEXT,                   -- newline-joined poem body (PGroonga target)
-    tags        TEXT[],
-    extra       JSONB,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+    id            BIGSERIAL PRIMARY KEY,
+    title         TEXT,
+    author_id     BIGINT REFERENCES authors (id) ON DELETE SET NULL,
+    dynasty       TEXT,
+    collection    TEXT NOT NULL,
+    text          TEXT,          -- newline-joined poem body
+    tags          TEXT[],
+    extra         JSONB,
+    content_hash  TEXT UNIQUE,   -- MD5(author|title|text) dedup key
+    created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
--- PGroonga full-text index (text and title only; author/dynasty served by B-tree)
+-- Full-text search on poem body and title (author/dynasty served by B-tree)
 CREATE INDEX IF NOT EXISTS idx_poems_pgroonga
     ON poems
     USING pgroonga (text, title)
     WITH (tokenizer='TokenNgram("unify_alphabet", false, "unify_digit", false)');
 
-CREATE INDEX IF NOT EXISTS idx_poems_dynasty_author_id
-    ON poems (dynasty, author_id);
-
-CREATE INDEX IF NOT EXISTS idx_poems_collection
-    ON poems (collection);
-
-CREATE INDEX IF NOT EXISTS idx_poems_author_id
-    ON poems (author_id);
+CREATE INDEX IF NOT EXISTS idx_poems_dynasty_author_id ON poems (dynasty, author_id);
+CREATE INDEX IF NOT EXISTS idx_poems_collection        ON poems (collection);
+CREATE INDEX IF NOT EXISTS idx_poems_author_id         ON poems (author_id);
 
 -- ── Views ─────────────────────────────────────────────────────────────────────
 
@@ -107,51 +97,60 @@ LEFT JOIN (
 ) p ON p.author_id = a.id
 ORDER BY poem_count DESC;
 
--- ── Helper functions (called by the import script) ───────────────────────────
+-- ── Migration: add content_hash to an existing database ──────────────────────
+-- Run once on a live DB that pre-dates content_hash. All statements are idempotent.
 
-CREATE OR REPLACE FUNCTION drop_poem_search_index()
-RETURNS void AS $$
-BEGIN
-    SET LOCAL statement_timeout = 0;
-    DROP INDEX IF EXISTS idx_poems_pgroonga;
-END;
-$$ LANGUAGE plpgsql;
+-- 1. Add column.
+-- ALTER TABLE poems ADD COLUMN IF NOT EXISTS content_hash TEXT;
 
-CREATE OR REPLACE FUNCTION rebuild_poem_search_index()
-RETURNS void AS $$
-BEGIN
-    SET LOCAL statement_timeout = 0;
-    CREATE INDEX IF NOT EXISTS idx_poems_pgroonga
-        ON poems
-        USING pgroonga (text, title)
-        WITH (tokenizer='TokenNgram("unify_alphabet", false, "unify_digit", false)');
-END;
-$$ LANGUAGE plpgsql;
+-- 2. Backfill (covers punctuation/whitespace normalization; re-import with opencc
+--    is needed to deduplicate trad/simplified variants).
+-- UPDATE poems p
+-- SET content_hash = md5(
+--     regexp_replace(coalesce(a.name,  ''), '[[:space:]\u3000\u3001-\u303F\uFF00-\uFFEF]', '', 'g') || '|' ||
+--     regexp_replace(coalesce(p.title, ''), '[[:space:]\u3000\u3001-\u303F\uFF00-\uFFEF]', '', 'g') || '|' ||
+--     regexp_replace(coalesce(p.text,  ''), '[[:space:]\u3000\u3001-\u303F\uFF00-\uFFEF]', '', 'g'))
+-- FROM authors a WHERE a.id = p.author_id AND p.content_hash IS NULL;
+--
+-- UPDATE poems
+-- SET content_hash = md5(
+--     '' || '|' ||
+--     regexp_replace(coalesce(title, ''), '[[:space:]\u3000\u3001-\u303F\uFF00-\uFFEF]', '', 'g') || '|' ||
+--     regexp_replace(coalesce(text,  ''), '[[:space:]\u3000\u3001-\u303F\uFF00-\uFFEF]', '', 'g'))
+-- WHERE author_id IS NULL AND content_hash IS NULL;
 
--- No-op: author_id is set during import via prescan before poems are inserted.
--- Kept for interface compatibility.
-CREATE OR REPLACE FUNCTION find_unlinked_authors()
-RETURNS TABLE (author TEXT, dynasty TEXT) AS $$
-    SELECT NULL::TEXT, NULL::TEXT WHERE FALSE;
-$$ LANGUAGE sql;
+-- 3. Drop exact duplicates, keep lowest id.
+-- DELETE FROM poems WHERE id IN (
+--     SELECT id FROM (
+--         SELECT id, ROW_NUMBER() OVER (PARTITION BY content_hash ORDER BY id) AS rn
+--         FROM poems WHERE content_hash IS NOT NULL
+--     ) t WHERE rn > 1
+-- );
 
--- No-op: author_id is set during import.
--- Kept for interface compatibility.
-CREATE OR REPLACE FUNCTION link_poems_to_authors()
-RETURNS void AS $$
-BEGIN
-    NULL;
-END;
-$$ LANGUAGE plpgsql;
+-- 4. Apply the unique constraint.
+-- ALTER TABLE poems ADD CONSTRAINT poems_content_hash_key UNIQUE (content_hash);
+
+-- 5. Find fuzzy near-duplicates (trad/simplified variants, punctuation survivors).
+-- CREATE INDEX IF NOT EXISTS idx_poems_trgm ON poems USING gin (text gin_trgm_ops);
+--
+-- SELECT p1.id AS keep_id, p2.id AS dup_id,
+--        round(similarity(p1.text, p2.text)::numeric, 2) AS sim,
+--        p1.title, p1.collection, p2.collection AS dup_collection
+-- FROM poems p1
+-- JOIN poems p2 ON p1.author_id = p2.author_id AND p1.id < p2.id
+-- WHERE similarity(p1.text, p2.text) >= 0.90
+-- ORDER BY sim DESC LIMIT 200;
+--
+-- DELETE FROM poems WHERE id IN (
+--     SELECT p2.id FROM poems p1
+--     JOIN poems p2 ON p1.author_id = p2.author_id
+--                  AND p1.id < p2.id
+--                  AND similarity(p1.text, p2.text) >= 0.90
+-- );
 
 -- ── Example queries ───────────────────────────────────────────────────────────
 
--- Full-text search poems:
 -- SELECT id, title, dynasty FROM poems WHERE text &@~ '春风' LIMIT 20;
-
--- Get an author with their poem count:
 -- SELECT * FROM view_authors_with_counts WHERE name = '李白';
-
--- Authors you still need to curate bios for:
 -- SELECT name, dynasty, poem_count FROM view_authors_with_counts
--- WHERE bio_curated = false ORDER BY poem_count DESC;
+-- WHERE NOT bio_curated ORDER BY poem_count DESC;

@@ -1,6 +1,6 @@
 # linggu-db
 
-A Supabase database of classical Chinese poetry, seeded from the open-source [chinese-poetry](https://github.com/chinese-poetry/chinese-poetry) collection. Full-text search is powered by the [PGroonga](https://pgroonga.github.io/) extension with Ngram tokenisation, making it suitable for CJK queries.
+A PostgreSQL database of classical Chinese poetry, seeded from the open-source [chinese-poetry](https://github.com/chinese-poetry/chinese-poetry) collection. Full-text search is powered by the [PGroonga](https://pgroonga.github.io/) extension with Ngram tokenisation, making it suitable for CJK queries.
 
 ## Tables
 
@@ -26,26 +26,25 @@ A Supabase database of classical Chinese poetry, seeded from the open-source [ch
 
 ### 1. Prerequisites
 
-- [Supabase](https://supabase.com) project (or local CLI)
+- PostgreSQL server with the [PGroonga](https://pgroonga.github.io/install/) extension installed
 - Python 3.11+
-- PGroonga extension enabled on your Supabase project
 
-  ```sql
-  CREATE EXTENSION IF NOT EXISTS pgroonga;
-  ```
+Enable the extension in your database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgroonga;
+```
 
 ### 2. Apply the schema
 
-Run [schema.sql](schema.sql) in the Supabase SQL editor, or push the migration:
-
 ```bash
-supabase db push
+psql -d your_database -f schema.sql
 ```
 
 ### 3. Install Python dependencies
 
 ```bash
-pip install supabase gitpython tqdm python-dotenv
+pip install "psycopg[binary]" gitpython tqdm python-dotenv
 ```
 
 ### 4. Configure environment
@@ -53,8 +52,7 @@ pip install supabase gitpython tqdm python-dotenv
 Create a `.env` file in the project root:
 
 ```env
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-service-role-key
+POSTGRES_DSN=postgresql://user:password@host:5432/your_database
 ```
 
 ### 5. Run the import
@@ -70,22 +68,11 @@ The script will:
 4. Import poems in batches of 500.
 5. Link `poems.author_id` to the corresponding `authors` row.
 
-## Local development
-
-```bash
-supabase start   # starts local Postgres + API on port 54321
-supabase db push # applies migrations
-```
-
 ## Project structure
 
 ```
-schema.sql                          Raw schema (create tables, indexes, views, functions)
-import_chinese_poetry.py            Data import script
-supabase/
-  config.toml                       Supabase CLI config (project_id: linggu-db)
-  migrations/
-    20260319021148_initial_schema.sql
+schema.sql                  Raw schema (create tables, indexes, views, functions)
+import_chinese_poetry.py    Data import script
 ```
 
 ## License

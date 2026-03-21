@@ -1,3 +1,6 @@
+discarded_poems.csv
+test.sql
+
 # Environment & secrets
 .env
 .env.*

@@ -2,32 +2,49 @@
 Chinese Poetry → Postgres Import Script
 =========================================
 Imports all collections from https://github.com/chinese-poetry/chinese-poetry
-into the `poems` and `authors` tables (see schema.sql).
-
-Run order:
-  1. Start Postgres: docker compose up -d
-  2. This script (imports authors first, then poems, then links them)
+into the `poems` and `authors` tables defined in schema.sql.
 
 SETUP
-------
+-----
   pip install "psycopg[binary]" gitpython tqdm python-dotenv
+  pip install opencc-python-reimplemented   # optional: catches trad/simplified variants
 
   export POSTGRES_DSN="postgresql://postgres:yourpassword@localhost:5432/linggu"
   python import_chinese_poetry.py
 """
 
-import os
-import json
+import csv
+import git
 import hashlib
+import json
 import logging
-
-from dotenv import load_dotenv
-
+import os
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Generator
 
 import psycopg
+from dotenv import load_dotenv
+from psycopg.types.json import Jsonb
 from tqdm import tqdm
+
+# ── Optional: traditional ↔ simplified Chinese conversion ─────────────────────
+# Catches duplicate poems that exist in both scripts.
+# Install: pip install opencc-python-reimplemented
+_CC = None
+try:
+    import opencc as _opencc_mod
+    _CC = _opencc_mod.OpenCC('t2s')   # traditional → simplified
+except ImportError:
+    pass
+
+# Strips everything that is NOT a CJK ideograph or ASCII alphanumeric.
+# This normalises away punctuation variants (。vs . vs ，vs ,) and whitespace.
+_NON_HANZI_RE = re.compile(
+    r'[^\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFFa-z0-9]',
+    re.IGNORECASE,
+)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -39,6 +56,7 @@ REPO_URL   = "https://github.com/chinese-poetry/chinese-poetry.git"
 REPO_DIR   = Path("/tmp/chinese-poetry")
 BATCH_SIZE = 500
 TRUNCATE   = True   # Wipes both tables before importing. Set False to append.
+REPORT_PATH = Path("discarded_poems.csv")  # Set to None to disable the report.
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -56,7 +74,6 @@ def ensure_repo():
         log.info("Repo already present at %s, skipping clone.", REPO_DIR)
         return
     log.info("Cloning repo (may take a minute for ~1 GB of JSON)...")
-    import git
     git.Repo.clone_from(REPO_URL, REPO_DIR, depth=1)
     log.info("Clone complete.")
 
@@ -92,9 +109,24 @@ def load_json(path: Path) -> list[dict]:
         return []
 
 
+def _normalize(text: str | None) -> str:
+    """
+    Normalise a string for deduplication:
+      1. NFKC — collapses full-width characters (Ａ→A, ０→0, etc.)
+      2. Traditional → simplified Chinese (requires opencc; skipped if not installed)
+      3. Strip everything except CJK ideographs and ASCII alphanumerics
+         — removes all whitespace, punctuation, and symbol variants
+    """
+    if not text:
+        return ''
+    text = unicodedata.normalize('NFKC', text)
+    if _CC is not None:
+        text = _CC.convert(text)
+    return _NON_HANZI_RE.sub('', text).lower()
+
+
 def content_hash(author: str | None, title: str | None, text: str | None) -> str:
-    first_line = (text or "").split("\n")[0].strip()
-    key = f"{(author or '').strip()}|{(title or '').strip()}|{first_line}"
+    key = f"{_normalize(author)}|{_normalize(title)}|{_normalize(text)}"
     return hashlib.md5(key.encode("utf-8")).hexdigest()
 
 
@@ -110,17 +142,12 @@ def chunked(iterable, size):
 
 # ── Author import ─────────────────────────────────────────────────────────────
 #
-# Author files in the repo:
+# Source files:
 #   全唐诗/authors.tang.json   — Tang poets
-#   全唐诗/authors.song.json   — Song shi poets
-#   宋词/author.song.json      — Song ci poets
+#   全唐诗/authors.song.json   — Song 诗 poets
+#   宋词/author.song.json      — Song 词 poets
 #
-# Each record shape (fields vary slightly by file):
-#   { "name": "李白", "description": "...", "short_description": "..." }
-#   { "name": "苏轼", "desc": "...", "short_desc": "..." }   (ci file uses these)
-#
-# We normalise everything into source_long_desc / source_short_desc and
-# leave the curated bio_short / bio_long columns NULL for manual editing.
+# bio_short and bio_long are left NULL after import — curate them manually.
 
 AUTHOR_FILES = [
     ("全唐诗/authors.tang.json",  "唐"),
@@ -129,24 +156,9 @@ AUTHOR_FILES = [
 ]
 
 
-def parse_author(record: dict, dynasty: str) -> dict | None:
-    name = (record.get("name") or "").strip()
-    if not name:
-        return None
-
-    return {
-        "name":     name,
-        "dynasty":  dynasty,
-        "bio_short": None,   # curate manually later
-        "bio_long":  None,
-    }
-
-
 def import_authors(conn: psycopg.Connection, repo: Path) -> dict[str, int]:
-    """
-    Load all author files, deduplicate by name, upsert into authors table.
-    Returns a dict of {name: id} for use when linking poems.
-    """
+    """Load all author files, deduplicate by name, upsert into authors table.
+    Returns a dict of {name: id} for use when linking poems."""
     log.info("Importing authors...")
     seen: dict[str, dict] = {}   # name → record (first occurrence wins)
 
@@ -156,9 +168,9 @@ def import_authors(conn: psycopg.Connection, repo: Path) -> dict[str, int]:
             log.warning("Author file not found, skipping: %s", path)
             continue
         for record in load_json(path):
-            parsed = parse_author(record, dynasty)
-            if parsed and parsed["name"] not in seen:
-                seen[parsed["name"]] = parsed
+            name = (record.get("name") or "").strip()
+            if name and name not in seen:
+                seen[name] = {"name": name, "dynasty": dynasty, "bio_short": None, "bio_long": None}
 
     records = list(seen.values())
     log.info("Found %d unique authors across all files.", len(records))
@@ -185,152 +197,42 @@ def import_authors(conn: psycopg.Connection, repo: Path) -> dict[str, int]:
         cur.execute("SELECT id, name FROM authors")
         return {row[1]: row[0] for row in cur.fetchall()}
 
-# ── Poem normalizers ──────────────────────────────────────────────────────────
+# ── Poem normalizer ───────────────────────────────────────────────────────────
 
-def norm_shi(r: dict, collection: str, dynasty: str) -> dict:
-    lines = _lines(r.get("paragraphs"))
+_UNSET = object()  # sentinel: author not supplied → look it up from the record
+
+def _norm(
+    r: dict,
+    *,
+    collection: str,
+    dynasty: str | None,
+    author: Any = _UNSET,                        # fixed value, or _UNSET to read from record
+    author_keys: tuple[str, ...] = ("author",),  # record keys tried in order when author is _UNSET
+    body_keys: tuple[str, ...] = ("paragraphs",),
+    title_keys: tuple[str, ...] = ("title",),
+    tag_key: str | None = None,   # single tag: [r[tag_key]] or []
+    tags_key: str | None = None,  # list of tags: _lines(r[tags_key])
+    extra_exclude: set[str] | None = None,
+) -> dict:
+    body  = next((r.get(k) for k in body_keys  if r.get(k)), None)
+    title = next((r.get(k) for k in title_keys if r.get(k)), None)
+    if author is _UNSET:
+        author = next((r.get(k) for k in author_keys if r.get(k)), None)
+    if tags_key:
+        tags = _lines(r.get(tags_key))
+    elif tag_key:
+        tags = [r[tag_key]] if r.get(tag_key) else []
+    else:
+        tags = []
+    extra = ({k: v for k, v in r.items() if k not in extra_exclude} or None) if extra_exclude else None
     return {
         "collection": collection,
         "dynasty":    dynasty,
-        "author":     r.get("author") or r.get("poet"),
-        "title":      r.get("title"),
-        "text":       _text(lines),
-        "tags":       _lines(r.get("tags")),
-        "extra":      None,
-    }
-
-def norm_ci(r: dict) -> dict:
-    lines = _lines(r.get("paragraphs"))
-    return {
-        "collection": "宋词",
-        "dynasty":    "宋",
-        "author":     r.get("author"),
-        "title":      r.get("rhythmic"),
-        "text":       _text(lines),
-        "tags":       [r["rhythmic"]] if r.get("rhythmic") else [],
-        "extra":      None,
-    }
-
-def norm_shijing(r: dict) -> dict:
-    lines = _lines(r.get("content"))
-    used = {"title", "content", "section"}
-    return {
-        "collection": "诗经",
-        "dynasty":    "先秦",
-        "author":     None,
-        "title":      r.get("title"),
-        "text":       _text(lines),
-        "tags":       [r["section"]] if r.get("section") else [],
-        "extra":      {k: v for k, v in r.items() if k not in used} or None,
-    }
-
-def norm_lunyu(r: dict) -> dict:
-    lines = _lines(r.get("paragraphs"))
-    return {
-        "collection": "论语",
-        "dynasty":    "先秦",
-        "author":     "孔子",
-        "title":      r.get("chapter"),
-        "text":       _text(lines),
-        "tags":       [],
-        "extra":      None,
-    }
-
-def norm_wudai(r: dict, sub: str) -> dict:
-    lines = _lines(r.get("paragraphs"))
-    return {
-        "collection": f"五代·{sub}",
-        "dynasty":    "五代",
-        "author":     r.get("author"),
-        "title":      r.get("rhythmic") or r.get("title"),
-        "text":       _text(lines),
-        "tags":       [r["rhythmic"]] if r.get("rhythmic") else [],
-        "extra":      None,
-    }
-
-def norm_yuanqu(r: dict) -> dict:
-    lines = _lines(r.get("paragraphs"))
-    return {
-        "collection": "元曲",
-        "dynasty":    "元",
-        "author":     r.get("author"),
-        "title":      r.get("title"),
-        "text":       _text(lines),
-        "tags":       [r["rhythmic"]] if r.get("rhythmic") else [],
-        "extra":      None,
-    }
-
-def norm_nalan(r: dict) -> dict:
-    lines = _lines(r.get("para") or r.get("paragraphs"))
-    return {
-        "collection": "纳兰性德",
-        "dynasty":    "清",
-        "author":     "纳兰性德",
-        "title":      r.get("rhythmic") or r.get("title"),
-        "text":       _text(lines),
-        "tags":       [r["rhythmic"]] if r.get("rhythmic") else [],
-        "extra":      None,
-    }
-
-def norm_caocao(r: dict) -> dict:
-    lines = _lines(r.get("paragraphs"))
-    return {
-        "collection": "曹操诗集",
-        "dynasty":    "汉",
-        "author":     "曹操",
-        "title":      r.get("title"),
-        "text":       _text(lines),
-        "tags":       [],
-        "extra":      None,
-    }
-
-def norm_chuci(r: dict) -> dict:
-    lines = _lines(r.get("content") or r.get("paragraphs"))
-    return {
-        "collection": "楚辞",
-        "dynasty":    "先秦",
-        "author":     r.get("author"),
-        "title":      r.get("title") or r.get("section"),
-        "text":       _text(lines),
-        "tags":       [],
-        "extra":      None,
-    }
-
-def norm_mengxue(r: dict) -> dict:
-    lines = _lines(r.get("paragraphs"))
-    return {
-        "collection": "蒙学",
-        "dynasty":    None,
-        "author":     r.get("author"),
-        "title":      r.get("title"),
-        "text":       _text(lines),
-        "tags":       [],
-        "extra":      None,
-    }
-
-def norm_sishuwujing(r: dict) -> dict:
-    lines = _lines(r.get("paragraphs") or r.get("content"))
-    used = {"title", "chapter", "paragraphs", "content"}
-    return {
-        "collection": "四书五经",
-        "dynasty":    "先秦",
-        "author":     None,
-        "title":      r.get("title") or r.get("chapter"),
-        "text":       _text(lines),
-        "tags":       [],
-        "extra":      {k: v for k, v in r.items() if k not in used} or None,
-    }
-
-def norm_youmeng(r: dict) -> dict:
-    lines = _lines(r.get("paragraphs") or r.get("content"))
-    return {
-        "collection": "幽梦影",
-        "dynasty":    "清",
-        "author":     r.get("author"),
-        "title":      r.get("title"),
-        "text":       _text(lines),
-        "tags":       [],
-        "extra":      None,
+        "author":     author,
+        "title":      title,
+        "text":       _text(_lines(body)),
+        "tags":       tags,
+        "extra":      extra,
     }
 
 # ── Poem collection iterator ──────────────────────────────────────────────────
@@ -348,69 +250,80 @@ def iter_all_poems(repo: Path) -> Generator[dict, None, None]:
 
     for f in sorted(tang_dir.glob("poet.tang.*.json")):
         for r in load_json(f):
-            yield norm_shi(r, "唐诗", "唐")
+            yield _norm(r, collection="唐诗", dynasty="唐", author_keys=("author", "poet"), tags_key="tags")
 
     for f in sorted(tang_dir.glob("poet.song.*.json")):
         for r in load_json(f):
-            yield norm_shi(r, "宋诗", "宋")
+            yield _norm(r, collection="宋诗", dynasty="宋", author_keys=("author", "poet"), tags_key="tags")
 
     for f in sorted((repo / "宋词").glob("ci.song.*.json")):
         for r in load_json(f):
-            yield norm_ci(r)
+            yield _norm(r, collection="宋词", dynasty="宋", title_keys=("rhythmic",), tag_key="rhythmic")
 
     for sub, label in [("huajianji", "花间集"), ("nantang", "南唐二主词")]:
         d = repo / "五代诗词" / sub
         if d.exists():
             for f in sorted(d.glob("*.json")):
                 for r in load_json(f):
-                    yield norm_wudai(r, label)
+                    yield _norm(r, collection=f"五代·{label}", dynasty="五代",
+                                title_keys=("rhythmic", "title"), tag_key="rhythmic")
 
     for f in sorted((repo / "诗经").glob("*.json")):
         for r in load_json(f):
-            yield norm_shijing(r)
+            yield _norm(r, collection="诗经", dynasty="先秦", author=None,
+                        body_keys=("content",), tag_key="section",
+                        extra_exclude={"title", "content", "section"})
 
     for f in sorted((repo / "论语").glob("*.json")):
         for r in load_json(f):
-            yield norm_lunyu(r)
+            yield _norm(r, collection="论语", dynasty="先秦", author="孔子", title_keys=("chapter",))
 
-    for name, fn in [
-        ("楚辞",   norm_chuci),
-        ("蒙学",   norm_mengxue),
-        ("幽梦影", norm_youmeng),
+    for name, kwargs in [
+        ("楚辞",   dict(collection="楚辞",   dynasty="先秦", body_keys=("content", "paragraphs"), title_keys=("title", "section"))),
+        ("蒙学",   dict(collection="蒙学",   dynasty=None,   body_keys=("paragraphs", "content"))),
+        ("幽梦影", dict(collection="幽梦影", dynasty="清",   body_keys=("paragraphs", "content"))),
     ]:
         d = repo / name
         if d.exists():
             for f in sorted(d.glob("*.json")):
                 for r in load_json(f):
-                    yield fn(r)
+                    yield _norm(r, **kwargs)
 
     d = repo / "元曲"
     if d.exists():
         for f in sorted(d.glob("*.json")):
             for r in load_json(f):
-                yield norm_yuanqu(r)
+                yield _norm(r, collection="元曲", dynasty="元", tag_key="rhythmic")
 
     d = repo / "纳兰性德"
     if d.exists():
         for f in sorted(d.glob("*.json")):
             for r in load_json(f):
-                yield norm_nalan(r)
+                yield _norm(r, collection="纳兰性德", dynasty="清", author="纳兰性德",
+                            body_keys=("para", "paragraphs"), title_keys=("rhythmic", "title"), tag_key="rhythmic")
 
     d = repo / "曹操诗集"
     if d.exists():
         for f in sorted(d.glob("*.json")):
             for r in load_json(f):
-                yield norm_caocao(r)
+                yield _norm(r, collection="曹操诗集", dynasty="汉", author="曹操")
 
     d = repo / "四书五经"
     if d.exists():
         for f in sorted(d.glob("*.json")):
             for r in load_json(f):
-                yield norm_sishuwujing(r)
+                yield _norm(r, collection="四书五经", dynasty="先秦", author=None,
+                            body_keys=("paragraphs", "content"), title_keys=("title", "chapter"),
+                            extra_exclude={"title", "chapter", "paragraphs", "content"})
 
 
-def deduped(records: Generator[dict, None, None]) -> Generator[dict, None, None]:
-    seen: set[str] = set()
+def deduped(
+    records: Generator[dict, None, None],
+    report: Any | None = None,
+) -> Generator[dict, None, None]:
+    # Maps hash → (title, collection) of the first-seen (canonical) poem.
+    # Storing only two strings keeps peak memory low even for ~1 M records.
+    seen: dict[str, tuple[str, str]] = {}
     dupes = 0
     for rec in records:
         h = content_hash(rec["author"], rec["title"], rec["text"])
@@ -418,13 +331,25 @@ def deduped(records: Generator[dict, None, None]) -> Generator[dict, None, None]
             dupes += 1
             if dupes % 1000 == 0:
                 log.info("Skipped %d duplicates so far...", dupes)
+            if report is not None:
+                canonical_title, canonical_collection = seen[h]
+                report.writerow([
+                    rec.get("author") or "",
+                    rec.get("title") or "",
+                    rec.get("dynasty") or "",
+                    rec.get("collection") or "",
+                    (rec.get("text") or "")[:120].replace("\n", " "),
+                    h,
+                    canonical_title,
+                    canonical_collection,
+                ])
             continue
-        seen.add(h)
+        seen[h] = (rec.get("title") or "", rec.get("collection") or "")
+        rec["content_hash"] = h
         yield rec
     if dupes:
         log.info("Total duplicates skipped: %d", dupes)
 
-# ── Direct postgres DDL ───────────────────────────────────────────────────────
 
 # ── Poem import ───────────────────────────────────────────────────────────────
 
@@ -441,42 +366,60 @@ def import_poems(conn: psycopg.Connection, repo: Path, author_id_map: dict[str, 
     total = 0
     errors = 0
 
-    with tqdm(unit=" rows", desc="Poems") as bar:
-        for batch in chunked(deduped(iter_all_poems(repo)), BATCH_SIZE):
-            rows = []
-            for poem in batch:
-                author_name = poem.pop("author", None)
-                poem["author_id"] = author_id_map.get(author_name)
-                rows.append(poem)
-            try:
-                with conn.cursor() as cur:
-                    cur.executemany(
-                        """
-                        INSERT INTO poems
-                            (title, author_id, dynasty, collection, text, tags, extra)
-                        VALUES
-                            (%(title)s, %(author_id)s, %(dynasty)s, %(collection)s,
-                             %(text)s, %(tags)s, %(extra)s)
-                        """,
-                        rows,
-                    )
-                conn.commit()
-                total += len(rows)
-                bar.update(len(rows))
-            except Exception as e:
-                conn.rollback()
-                errors += len(rows)
-                log.error("Batch failed (%d rows): %s", len(rows), e)
+    report_fh = None
+    report_writer = None
+    if REPORT_PATH is not None:
+        report_fh = open(REPORT_PATH, "w", newline="", encoding="utf-8")
+        report_writer = csv.writer(report_fh)
+        report_writer.writerow([
+            "author", "title", "dynasty", "collection", "text_preview",
+            "content_hash", "canonical_title", "canonical_collection",
+        ])
+
+    try:
+        with tqdm(unit=" rows", desc="Poems") as bar:
+            for batch in chunked(deduped(iter_all_poems(repo), report=report_writer), BATCH_SIZE):
+                rows = []
+                for poem in batch:
+                    author_name = poem.pop("author", None)
+                    poem["author_id"] = author_id_map.get(author_name)
+                    if poem.get("extra") is not None:
+                        poem["extra"] = Jsonb(poem["extra"])
+                    rows.append(poem)
+                try:
+                    with conn.cursor() as cur:
+                        cur.executemany(
+                            """
+                            INSERT INTO poems
+                                (title, author_id, dynasty, collection, text, tags, extra, content_hash)
+                            VALUES
+                                (%(title)s, %(author_id)s, %(dynasty)s, %(collection)s,
+                                 %(text)s, %(tags)s, %(extra)s, %(content_hash)s)
+                            ON CONFLICT (content_hash) DO NOTHING
+                            """,
+                            rows,
+                        )
+                    conn.commit()
+                    total += len(rows)
+                    bar.update(len(rows))
+                except Exception as e:
+                    conn.rollback()
+                    errors += len(rows)
+                    log.error("Batch failed (%d rows): %s", len(rows), e)
+    finally:
+        if report_fh is not None:
+            report_fh.close()
+            log.info("Discard report written to %s", REPORT_PATH)
 
     log.info("Poems imported: %d, errors: %d", total, errors)
 
-    log.info("Rebuilding PGroonga index — this can take 10–30 min for ~1 M rows. The process is not frozen.")
+    log.info("Rebuilding PGroonga index...")
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 CREATE INDEX idx_poems_pgroonga ON poems
-                USING pgroonga (title, dynasty, collection, text)
+                USING pgroonga (text, title)
                 WITH (tokenizer='TokenNgram("unify_alphabet", false, "unify_digit", false)')
                 """
             )
@@ -487,7 +430,7 @@ def import_poems(conn: psycopg.Connection, repo: Path, author_id_map: dict[str, 
         log.error(
             "Index rebuild failed. Run this manually:\n"
             "  CREATE INDEX idx_poems_pgroonga ON poems\n"
-            "  USING pgroonga (title, dynasty, collection, text)\n"
+            "  USING pgroonga (text, title)\n"
             "  WITH (tokenizer='TokenNgram(\"unify_alphabet\", false, \"unify_digit\", false)');\n"
             "Error: %s", e
         )
@@ -539,6 +482,13 @@ def main():
         raise SystemExit(
             "Set POSTGRES_DSN before running.\n"
             "  export POSTGRES_DSN='postgresql://postgres:yourpassword@localhost:5432/linggu'"
+        )
+
+    if _CC is None:
+        log.warning(
+            "opencc not installed — traditional/simplified variants will NOT be "
+            "caught by the content_hash dedup. "
+            "Install with: pip install opencc-python-reimplemented"
         )
 
     ensure_repo()

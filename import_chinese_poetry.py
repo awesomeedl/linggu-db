@@ -1,19 +1,18 @@
 """
-Chinese Poetry → Supabase Import Script
+Chinese Poetry → Postgres Import Script
 =========================================
 Imports all collections from https://github.com/chinese-poetry/chinese-poetry
 into the `poems` and `authors` tables (see schema.sql).
 
 Run order:
-  1. schema.sql in Supabase SQL editor
+  1. Start Postgres: docker compose up -d
   2. This script (imports authors first, then poems, then links them)
 
 SETUP
 ------
-  pip install supabase gitpython tqdm
+  pip install "psycopg[binary]" gitpython tqdm python-dotenv
 
-  export SUPABASE_URL="https://xxxx.supabase.co"
-  export SUPABASE_KEY="your-service-role-key"
+  export POSTGRES_DSN="postgresql://postgres:yourpassword@localhost:5432/linggu"
   python import_chinese_poetry.py
 """
 
@@ -21,22 +20,20 @@ import os
 import json
 import hashlib
 import logging
-import subprocess
 
 from dotenv import load_dotenv
 
 from pathlib import Path
-from typing import Any, Generator, cast
+from typing import Any, Generator
 
-from supabase import create_client, Client
+import psycopg
 from tqdm import tqdm
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 load_dotenv()
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://YOUR_PROJECT.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "YOUR_SERVICE_ROLE_KEY")
+POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "")
 
 REPO_URL   = "https://github.com/chinese-poetry/chinese-poetry.git"
 REPO_DIR   = Path("/tmp/chinese-poetry")
@@ -137,29 +134,15 @@ def parse_author(record: dict, dynasty: str) -> dict | None:
     if not name:
         return None
 
-    # The repo uses inconsistent field names across the three files
-    long_desc = (
-        record.get("description")
-        or record.get("long_description")
-        or record.get("desc")
-        or record.get("long_desc")
-    )
-    short_desc = (
-        record.get("short_description")
-        or record.get("short_desc")
-    )
-
     return {
-        "name":              name,
-        "dynasty":           dynasty,
-        "source_long_desc":  long_desc,
-        "source_short_desc": short_desc,
-        "bio_short":         None,   # curate manually later
-        "bio_long":          None,
+        "name":     name,
+        "dynasty":  dynasty,
+        "bio_short": None,   # curate manually later
+        "bio_long":  None,
     }
 
 
-def import_authors(supabase: Client, repo: Path):
+def import_authors(conn: psycopg.Connection, repo: Path) -> dict[str, int]:
     """
     Load all author files, deduplicate by name, upsert into authors table.
     Returns a dict of {name: id} for use when linking poems.
@@ -181,16 +164,26 @@ def import_authors(supabase: Client, repo: Path):
     log.info("Found %d unique authors across all files.", len(records))
 
     total = 0
-    for batch in chunked(records, BATCH_SIZE):
-        supabase.table("authors").upsert(batch, on_conflict="name").execute()
-        total += len(batch)
-
+    with conn.cursor() as cur:
+        for batch in chunked(records, BATCH_SIZE):
+            cur.executemany(
+                """
+                INSERT INTO authors (name, dynasty, bio_short, bio_long)
+                VALUES (%(name)s, %(dynasty)s, %(bio_short)s, %(bio_long)s)
+                ON CONFLICT (name) DO UPDATE SET
+                    dynasty = EXCLUDED.dynasty
+                """,
+                batch,
+            )
+            total += len(batch)
+    conn.commit()
     log.info("Authors imported: %d", total)
 
     # Fetch all author ids back so we can link poems
     log.info("Fetching author id map...")
-    rows: list[dict] = cast(list[dict], supabase.table("authors").select("id, name").execute().data or [])
-    return {row["name"]: row["id"] for row in rows}
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, name FROM authors")
+        return {row[1]: row[0] for row in cur.fetchall()}
 
 # ── Poem normalizers ──────────────────────────────────────────────────────────
 
@@ -431,189 +424,142 @@ def deduped(records: Generator[dict, None, None]) -> Generator[dict, None, None]
     if dupes:
         log.info("Total duplicates skipped: %d", dupes)
 
-# ── Direct postgres DDL (bypasses PostgREST for index management) ─────────────
-
-POSTGRES_DSN = os.environ.get("POSTGRES_DSN", "")
-
-def _psql(sql: str) -> bool:
-    """Run a SQL statement directly via psql. Returns True on success."""
-    result = subprocess.run(
-        ["psql", POSTGRES_DSN, "-c", sql],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        log.warning("psql error: %s", result.stderr.strip())
-        return False
-    return True
+# ── Direct postgres DDL ───────────────────────────────────────────────────────
 
 # ── Poem import ───────────────────────────────────────────────────────────────
 
-def import_poems(supabase: Client, repo: Path, author_id_map: dict[str, Any]):
+def import_poems(conn: psycopg.Connection, repo: Path, author_id_map: dict[str, Any]):
     log.info("Importing poems...")
 
     # Drop the PGroonga full-text index before bulk loading — updating it on every
-    # INSERT batch is what causes statement timeouts. We rebuild it once at the end.
+    # INSERT batch is slow. We rebuild it once at the end.
     log.info("Dropping PGroonga index for bulk load...")
-    if not _psql("DROP INDEX IF EXISTS idx_poems_pgroonga;"):
-        log.warning("Could not drop index via psql (will proceed anyway).")
+    with conn.cursor() as cur:
+        cur.execute("DROP INDEX IF EXISTS idx_poems_pgroonga")
+    conn.commit()
 
     total = 0
     errors = 0
 
     with tqdm(unit=" rows", desc="Poems") as bar:
         for batch in chunked(deduped(iter_all_poems(repo)), BATCH_SIZE):
-            # Attach author_id where we have a match
+            rows = []
             for poem in batch:
-                poem["author_id"] = author_id_map.get(poem["author"])
+                author_name = poem.pop("author", None)
+                poem["author_id"] = author_id_map.get(author_name)
+                rows.append(poem)
             try:
-                supabase.table("poems").insert(batch).execute()
-                total += len(batch)
-                bar.update(len(batch))
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        """
+                        INSERT INTO poems
+                            (title, author_id, dynasty, collection, text, tags, extra)
+                        VALUES
+                            (%(title)s, %(author_id)s, %(dynasty)s, %(collection)s,
+                             %(text)s, %(tags)s, %(extra)s)
+                        """,
+                        rows,
+                    )
+                conn.commit()
+                total += len(rows)
+                bar.update(len(rows))
             except Exception as e:
-                errors += len(batch)
-                log.error("Batch failed (%d rows): %s", len(batch), e)
+                conn.rollback()
+                errors += len(rows)
+                log.error("Batch failed (%d rows): %s", len(rows), e)
 
     log.info("Poems imported: %d, errors: %d", total, errors)
 
-    log.info("Rebuilding PGroonga index (this may take ~30 seconds)...")
-    ok = _psql(
-        "CREATE INDEX idx_poems_pgroonga ON poems "
-        "USING pgroonga (title, author, dynasty, collection, text) "
-        "WITH (tokenizer='TokenNgram(\"unify_alphabet\", false, \"unify_digit\", false)');"
-    )
-    if ok:
-        log.info("PGroonga index rebuilt.")
-    else:
-        log.error(
-            "Index rebuild failed. Run this manually in the SQL editor:\n"
-            "  CREATE INDEX idx_poems_pgroonga ON poems "
-            "USING pgroonga (title, author, dynasty, collection, text) "
-            "WITH (tokenizer='TokenNgram(\"unify_alphabet\", false, "
-            "\"unify_digit\", false)');"
-        )
-
-# ── Link any remaining poems whose authors weren't in the author files ─────────
-
-def link_remaining_authors(supabase: Client):
-    """
-    Some poems reference authors not present in the repo's author JSON files
-    (e.g. poets from 楚辞, 诗经, minor collections). This step ensures every
-    distinct author name in poems has a row in authors, even if bio fields are
-    empty — so you can fill them in during curation.
-    """
-    log.info("Inserting stub author rows for any unlinked poem authors...")
-
-    # Find authors in poems that have no matching authors row
-    # Fallback if the RPC doesn't exist: do it in Python
-    # (The RPC is optional — see schema.sql for the function definition)
+    log.info("Rebuilding PGroonga index — this can take 10–30 min for ~1 M rows. The process is not frozen.")
     try:
-        supabase.rpc("find_unlinked_authors").execute()
-    except Exception:
-        log.info("RPC not available, fetching unlinked authors in Python...")
-        all_poem_authors: list[dict] = cast(
-            list[dict],
-            supabase.table("poems")
-            .select("author, dynasty")
-            .neq("author", "")
-            .execute()
-            .data or [],
-        )
-        existing: set[str] = {
-            cast(str, row["name"])
-            for row in cast(list[dict], supabase.table("authors").select("name").execute().data or [])
-        }
-        # Collect one dynasty per author name
-        stubs: dict[str, str | None] = {}
-        for row in all_poem_authors:
-            name = cast(str | None, row.get("author"))
-            if name and name not in existing and name not in stubs:
-                stubs[name] = cast(str | None, row.get("dynasty"))
-
-        if stubs:
-            stub_records = [
-                {"name": name, "dynasty": dynasty}
-                for name, dynasty in stubs.items()
-            ]
-            log.info("Inserting %d stub author rows...", len(stub_records))
-            for batch in chunked(stub_records, BATCH_SIZE):
-                supabase.table("authors").upsert(
-                    batch, on_conflict="name"
-                ).execute()
-
-    # Now link poems → authors for the newly inserted stubs too
-    log.info("Linking poems.author_id → authors.id for any remaining gaps...")
-    try:
-        supabase.rpc("link_poems_to_authors").execute()
-    except Exception as e:
-        log.warning("RPC timed out (%s), falling back to batched Python linking...", e)
-        # Re-fetch full author map (includes freshly inserted stubs)
-        author_rows = cast(
-            list[dict],
-            supabase.table("authors").select("id, name").execute().data or [],
-        )
-        author_map = {row["name"]: row["id"] for row in author_rows}
-        linked = 0
-        PAGE = 1000
-        offset = 0
-        while True:
-            page = cast(
-                list[dict],
-                supabase.table("poems")
-                .select("id, author")
-                .is_("author_id", "null")
-                .neq("author", "null")
-                .range(offset, offset + PAGE - 1)
-                .execute().data or [],
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE INDEX idx_poems_pgroonga ON poems
+                USING pgroonga (title, dynasty, collection, text)
+                WITH (tokenizer='TokenNgram("unify_alphabet", false, "unify_digit", false)')
+                """
             )
-            if not page:
-                break
-            updates = [
-                {"id": p["id"], "author_id": author_map[p["author"]]}
-                for p in page
-                if p.get("author") and p["author"] in author_map
-            ]
-            if updates:
-                for batch in chunked(updates, BATCH_SIZE):
-                    supabase.table("poems").upsert(batch).execute()
-                linked += len(updates)
-            offset += PAGE
-        log.info("Linked %d previously unlinked poems via fallback.", linked)
+        conn.commit()
+        log.info("PGroonga index rebuilt.")
+    except Exception as e:
+        conn.rollback()
+        log.error(
+            "Index rebuild failed. Run this manually:\n"
+            "  CREATE INDEX idx_poems_pgroonga ON poems\n"
+            "  USING pgroonga (title, dynasty, collection, text)\n"
+            "  WITH (tokenizer='TokenNgram(\"unify_alphabet\", false, \"unify_digit\", false)');\n"
+            "Error: %s", e
+        )
+
+# ── Stub author prescan ───────────────────────────────────────────────────────
+
+def prescan_stub_authors(conn: psycopg.Connection, repo: Path, author_id_map: dict[str, Any]) -> dict[str, Any]:
+    """
+    Walk all poem records once before import. For every author name that isn't
+    already in author_id_map, insert a stub authors row so that import_poems
+    can always resolve author_id.
+
+    Returns an updated author_id_map that includes the newly created stubs.
+    """
+    log.info("Pre-scanning poems for author names missing from authors table...")
+    stubs: dict[str, str | None] = {}  # name → dynasty (first occurrence)
+    for rec in tqdm(iter_all_poems(repo), unit=" recs", desc="Pre-scan"):
+        name = rec.get("author")
+        if name and name not in author_id_map and name not in stubs:
+            stubs[name] = rec.get("dynasty")
+
+    if not stubs:
+        log.info("No stub authors needed.")
+        return author_id_map
+
+    log.info("Inserting %d stub author rows...", len(stubs))
+    stub_records = [{"name": n, "dynasty": d} for n, d in stubs.items()]
+    with conn.cursor() as cur:
+        for batch in chunked(stub_records, BATCH_SIZE):
+            cur.executemany(
+                """
+                INSERT INTO authors (name, dynasty)
+                VALUES (%(name)s, %(dynasty)s)
+                ON CONFLICT (name) DO NOTHING
+                """,
+                batch,
+            )
+    conn.commit()
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, name FROM authors")
+        return {row[1]: row[0] for row in cur.fetchall()}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    if SUPABASE_URL.startswith("https://YOUR") or not SUPABASE_URL:
-        raise SystemExit(
-            "Set SUPABASE_URL and SUPABASE_KEY before running.\n"
-            "  export SUPABASE_URL='https://xxxx.supabase.co'\n"
-            "  export SUPABASE_KEY='your-service-role-key'"
-        )
     if not POSTGRES_DSN:
         raise SystemExit(
             "Set POSTGRES_DSN before running.\n"
-            "  export POSTGRES_DSN='postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres'"
+            "  export POSTGRES_DSN='postgresql://postgres:yourpassword@localhost:5432/linggu'"
         )
 
     ensure_repo()
 
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    with psycopg.connect(POSTGRES_DSN, connect_timeout=10) as conn:
+        if TRUNCATE:
+            log.info("Truncating poems then authors...")
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE poems, authors RESTART IDENTITY CASCADE")
+            conn.commit()
 
-    if TRUNCATE:
-        log.info("Truncating poems then authors...")
-        # poems first (FK dependency)
-        supabase.table("poems").delete().neq("id", 0).execute()
-        supabase.table("authors").delete().neq("id", 0).execute()
+        # 1. Authors from the repo's dedicated author JSON files
+        author_id_map = import_authors(conn, REPO_DIR)
 
-    # 1. Authors
-    author_id_map = import_authors(supabase, REPO_DIR)
+        # 2. Stub rows for any author names that appear only in poem records
+        #    (e.g. 孔子, anonymous poets, minor collections) — must run before
+        #    import_poems so every poem.author_id can be resolved.
+        author_id_map = prescan_stub_authors(conn, REPO_DIR, author_id_map)
 
-    # 2. Poems (author_id attached inline where author name matches)
-    import_poems(supabase, REPO_DIR, author_id_map)
-
-    # 3. Stub rows + final linking for authors not in the repo's author files
-    link_remaining_authors(supabase)
+        # 3. Poems (author_id resolved and author name key dropped before insert)
+        import_poems(conn, REPO_DIR, author_id_map)
 
     log.info("All done.")
 
